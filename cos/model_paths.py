@@ -14,11 +14,11 @@ root_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 HF_LLAMA_7B_TEXT_DIR = f'{root_path}/models/hf-llama-2-7b/'
 HF_LLAMA_13B_TEXT_DIR = f'{root_path}/models/hf-llama-2-13b/'
-HF_LLAMA_7B_CHAT_DIR = f'{root_path}/models/hf-llama-2-7b-chat/'
-HF_LLAMA_13B_CHAT_DIR = f'{root_path}/models/hf-llama-2-13b-chat/'
+# HF_LLAMA_7B_CHAT_DIR = f'{root_path}/models/hf-llama-2-7b-chat/'
+HF_LLAMA_7B_CHAT_DIR = '/media/volume/yueru-s-data/Llama-2-7b-chat-hf/'
+# HF_LLAMA_13B_CHAT_DIR = f'{root_path}/models/hf-llama-2-13b-chat/'
+HF_LLAMA_13B_CHAT_DIR = '/media/volume/yueru-s-data/Llama-2-13b-chat-hf/'
 HF_ALPACA_DIR = f'{root_path}/models/alpaca/'
-
-
 
 LLAMA_7B_TEXT_DIR = f'{root_path}/models/llama-2-7b/'
 LLAMA_13B_TEXT_DIR = f'{root_path}/models/llama-2-13b/'

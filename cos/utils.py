@@ -55,13 +55,13 @@ def load_hf_model_and_tokenizer(model_name: str):
             ckpt_dir, 
             device_map='cuda',
             torch_dtype=torch.float16 # to stay the same as llama
-        ).cuda()
+        )
     elif "llama-3" in model_name:
         model = model_class.from_pretrained(
             ckpt_dir, 
             device_map='cuda',
             torch_dtype=torch.bfloat16 # to stay the same as llama
-        ).cuda()
+        )
     else:
         model = model_class.from_pretrained(
             ckpt_dir, 
@@ -119,7 +119,8 @@ def assert_dialog(dialog):
 def get_context_pair_dialogs(
     prompts: List[str], 
     contexts: List[str], 
-    put_context_first: bool = False
+    put_context_first: bool = False,
+    is_history: bool = False
 ):
     """
     Returns dialogs with context and dialogs without context by batching prompts and contexts.
@@ -129,15 +130,22 @@ def get_context_pair_dialogs(
     e.g. put_context_first=True would return "context prompt" instead of "prompt context" for each of
     the context dialogs.
     """
-    def return_pair(prompt, context):
+    def return_pair(prompt, context, is_history=is_history):
         # l2: prompt (l_1) + an chosen context
         if len(context) == 0:
             l_2 = prompt
+            d = [{"role": "user", "content": l_2},] #? meaning of the ",”
         elif len(prompt) == 0:
             l_2 = context
+            d = [{"role": "user", "content": l_2},]
         else:
-            l_2 = " ".join([context, prompt]) if put_context_first else " ".join([prompt, context])
-        d = [{"role": "user", "content": l_2},]
+            if is_history:
+                print(f"Using history context: {context}")
+                d_tmp = [{"role": "user", "content": prompt},]
+                d = context + d_tmp
+            else:
+                l_2 = " ".join([context, prompt]) if put_context_first else " ".join([prompt, context])
+                d = [{"role": "user", "content": l_2},]
         d_nc = [{"role": "user", "content": prompt}]
         return d, d_nc
     
@@ -216,7 +224,6 @@ def get_multi_context_pair_dialogs(
             dialogs[j].append(cd[j])
         dialogs_nc.append(ncd)
     return dialogs, dialogs_nc
-
 
 def get_multi_context_pair_texts(
     prompts: List[str], 

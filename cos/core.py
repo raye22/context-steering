@@ -53,10 +53,10 @@ def apply_cos(
     
     influence = next_lp - next_lp_nc # (N, L, V)
     cos_lp = next_lp + lambdas[:, None, None] * influence # (N, L, V)
+
     # normalize probabilities
     cos_lp = F.log_softmax(cos_lp, dim=-1)
     cos_lp = cos_lp.masked_fill(torch.logical_not(mask.bool())[:, :, None], 0)
-    
     output = torch.exp(cos_lp) if return_probs else cos_lp
     return output[:, -1] if last_token else output
 
@@ -77,7 +77,11 @@ def apply_multi_cos(
         assert len(logits.shape) == len(logits_nc.shape) == 3
         assert len(lambdas) == logits.shape[0]
         assert len(lambdas.shape) == 1
-
+    # print(len(all_logits))
+    # print(all_lambdas)
+    # print(f"all_logits: {[l.shape for l in all_logits]}")
+    # print(f"logits_nc: {logits_nc.shape}")
+    # print(f"all_lambdas: {[l for l in all_lambdas]}")
     if mask is None:
         # same shape as logits, all 0, only the last one is 1
         mask = torch.zeros(logits.shape[:-1], device=logits.device)
@@ -95,25 +99,31 @@ def apply_multi_cos(
     cos_lp = next_lp_nc.clone()
     all_influences = []
     for next_lp, lambdas in zip(all_next_lp, all_lambdas):
-        influence = next_lp - next_lp_nc # (N, L, V)
+        # print(f"next_lp: {next_lp.shape}, lambdas: {lambdas}")
+        influence = next_lp - next_lp_nc # (N, L, V) # calculate influence on one context
         all_influences.append(influence)
         cos_lp += lambdas[:, None, None] * influence # (N, L, V)
         # normalize probabilities
 
     cos_lp = cos_lp.masked_fill(torch.logical_not(mask.bool())[:, :, None], 0)
-    cos_lp = F.log_softmax(cos_lp, dim=-1)
-    output = torch.exp(cos_lp) if return_probs else cos_lp
+    cos_lp = F.log_softmax(cos_lp, dim=-1) # 🔒 1. Numerical Stability F.log_softmax(x) is more stable than torch.log(F.softmax(x))
+    output = torch.exp(cos_lp) if return_probs else cos_lp # equal to F.softmax(cos_lp, dim=-1)
     return output[:, -1] if last_token else output
 
         
 def get_seqs_logits(input_ids, mask, model, tokenizer, cache=None):
     with torch.no_grad():
+        # print(f"Input IDs: {input_ids}")
+        # print(f"Input IDs shape: {input_ids.shape}")
+        # print(f"Mask: {mask}")
+        # print(f"Mask shape: {mask.shape}")
         output = model.generate(
             input_ids=input_ids,
             attention_mask=mask, 
-            max_new_tokens=1, 
+            max_new_tokens=1, #### predict one token at a time
             return_dict_in_generate=True, 
-            output_scores=True, 
+            output_scores=True,
+            do_sample=False, #### add this to allow for logits output
             pad_token_id=tokenizer.pad_token_id, 
             eos_token_id=tokenizer.eos_token_id, 
             past_key_values=cache, 
@@ -141,6 +151,7 @@ def contextual_steering_hf(
     verbose: bool = False,
     skip_nan: bool = False,
     prompts_nc: List[str] = None,
+    is_history: bool = True,
 ) -> dict:
     """Generate response via Contextual Steering forward model p(response | lambda, prompt, context). Output one generation per prompt per lambda.
 
@@ -181,20 +192,22 @@ def contextual_steering_hf(
 
     if prompts_nc is None:
         if is_chat:
-            prompts, prompts_nc = get_context_pair_dialogs(prompts, contexts, put_context_first)
+            prompts, prompts_nc = get_context_pair_dialogs(prompts, contexts, put_context_first,is_history=is_history)
         else:
-            prompts, prompts_nc = get_context_pair_texts(prompts, contexts, put_context_first)
+            prompts, prompts_nc = get_context_pair_texts(prompts, contexts, put_context_first, is_history=is_history)
     else:
         assert len(prompts) == len(prompts_nc)
         if is_chat:
             for p, p_nc in zip(prompts, prompts_nc):
                 assert_dialog(p)
                 assert_dialog(p_nc)
-
+    print(f"prompts: {prompts}")
     repeated_prompts = tile_seqs(prompts, len(lambdas))
     repeated_prompts_nc = tile_seqs(prompts_nc, len(lambdas))
     repeated_contexts = tile_seqs(contexts, len(lambdas))
     repeated_lambdas = repeat_seqs(lambdas, len(prompts))
+    if is_chat:
+        tokenizer.padding_side = "left" # for chat models, pad on the left
     tokenize_chat = partial(
         tokenizer.apply_chat_template, 
         tokenize=True, 
@@ -202,10 +215,14 @@ def contextual_steering_hf(
         padding=True, 
         return_dict=True
     )
+    # model.device='cpu' # for debugging
+    # print(f'repeated_prompts: {repeated_prompts}')
     tokenize_text = partial(tokenizer, return_tensors="pt", padding=True)
     get_tokens = tokenize_chat if is_chat else tokenize_text
     repeated_inputs = get_tokens(repeated_prompts).to(model.device)
+    # print(f"Input prompts: {repeated_inputs}")
     repeated_inputs_nc = get_tokens(repeated_prompts_nc).to(model.device)
+    # print(f"Input prompts without context: {repeated_inputs_nc}")
 
     batch_size = max_batch_size
     if show_progress:
@@ -222,23 +239,37 @@ def contextual_steering_hf(
         cur_len = batch_ids.shape[1]
         total_len = min(max_seq_len, max_gen_len + cur_len)
         remain_len = total_len - cur_len
+
         if show_progress:
             pbar_prompt = tqdm.tqdm(total=remain_len, leave=False, desc='Generating')
 
         eos_reached = torch.zeros((batch_size, 1), device=model.device).bool()
         batch_out_tokens, batch_out_logprobs, batch_out_masks = [], [], []
+
+        #?
         cache_kv = DynamicCache()
         cache_kv_nc = DynamicCache()
+
         pad_id, eos_id = tokenizer.pad_token_id, tokenizer.eos_token_id
         neg_inf = torch.tensor(-float('inf'), device=model.device)
 
         for _ in range(cur_len, total_len):
+            # print('batch_ids:', batch_ids)
+            # print('batch_ids_nc:', batch_ids_nc)
+            # print('batch_ids shape:', batch_ids.shape)
+            # print('batch_ids_nc shape:', batch_ids_nc.shape)
+            # print('batch_mask:', batch_mask)
+            # print('batch_mask_nc:', batch_mask_nc)
+            # print('batch_mask shape:', batch_mask.shape)
+            # print('batch_mask_nc shape:', batch_mask_nc.shape)
             cur_logits = get_seqs_logits(
-                batch_ids, batch_mask, model, tokenizer, cache_kv
+                batch_ids, batch_mask, model, tokenizer, cache=cache_kv
             )
             cur_logits_nc = get_seqs_logits(
-                batch_ids_nc, batch_mask_nc, model, tokenizer, cache_kv_nc
+                batch_ids_nc, batch_mask_nc, model, tokenizer, cache=cache_kv_nc
             )
+            # print(f"Current logits: {cur_logits}")
+            # print(f"Current logits without context: {cur_logits_nc}")
             cos_probs = apply_cos(
                 logits=cur_logits.unsqueeze(1), 
                 logits_nc=cur_logits_nc.unsqueeze(1),
@@ -332,6 +363,7 @@ def get_cos_logprob_hf(
     relative_logit: bool = False,
     verbose: bool = False,
     show_progress: bool = True,
+    is_history: bool = False,
 ) -> List[float]:
     """Return the log probability of the response given the prompt and context. This can be achieved
     with one forward pass as opposed to generating token by token.
@@ -367,10 +399,10 @@ def get_cos_logprob_hf(
 
     if is_chat:
         if contexts_neg is not None:
-            prompts_neg, _ = get_context_pair_dialogs(prompts, contexts_neg, put_context_first)
-            prompts, prompts_nc = get_context_pair_dialogs(prompts, contexts, put_context_first)
+            prompts_neg, _ = get_context_pair_dialogs(prompts, contexts_neg, put_context_first, is_history=is_history)
+            prompts, prompts_nc = get_context_pair_dialogs(prompts, contexts, put_context_first, is_history=is_history)
         else:
-            prompts, prompts_nc = get_context_pair_dialogs(prompts, contexts, put_context_first)
+            prompts, prompts_nc = get_context_pair_dialogs(prompts, contexts, put_context_first, is_history=is_history)
             prompts_neg = prompts_nc
     else:
         if contexts_neg is not None:
@@ -381,7 +413,7 @@ def get_cos_logprob_hf(
             prompts_neg = prompts_nc
     repeated_contexts = tile_seqs(contexts, len(lambdas))
     repeated_lambdas = repeat_seqs(lambdas, len(prompts))
-
+    print(f'prompts: {prompts}')
     if is_chat:
         prompts_full = [
             p + [{'role': 'assistant', 'content': r}] for p, r in zip(prompts, responses)
@@ -393,6 +425,7 @@ def get_cos_logprob_hf(
         prompts_full = [f"{p} {r}" for p, r in zip(prompts, responses)]
         prompts_full_neg = [f"{p} {r}" for p, r in zip(prompts_neg, responses)]
 
+    print(f"prompts_full: {prompts_full}")
     repeated_prompts = tile_seqs(prompts, len(lambdas))
     repeated_toks_prompts = get_tokens(repeated_prompts).to(model.device)
     repeated_toks_prompts_neg = get_tokens(tile_seqs(prompts_neg, len(lambdas))).to(model.device)
@@ -453,12 +486,15 @@ def get_cos_logprob_hf(
         batch_resp_masks = torch.where(is_prompt[None, ], torch.zeros_like(batch_full_masks), batch_full_masks.bool())
         batch_resp_mask_last = torch.roll(batch_resp_masks, shifts=-1, dims=1)
 
+        # calculate logits in one forward process
         with torch.no_grad():
             logits = model(batch_full_ids, batch_full_masks, use_cache=False).logits
         logits = torch.log_softmax(logits, dim=-1)
         with torch.no_grad():
             logits_nc = model(batch_full_ids_neg, batch_full_masks_neg, use_cache=False).logits
         logits_nc = torch.log_softmax(logits_nc, dim=-1)
+
+        # apply contextual steering
         cos_probs = apply_cos(
             logits=logits, 
             logits_nc=logits_nc,
@@ -543,6 +579,9 @@ def multi_contextual_steering_hf(
     repeated_prompts = [tile_seqs(p, len(all_lambdas[0])) for p in prompts]
     repeated_prompts_nc = tile_seqs(prompts_nc, len(all_lambdas[0]))
     repeated_lambdas = [repeat_seqs(l, len(prompts_nc)) for l in all_lambdas]
+    print(f'repeated_prompts: {repeated_prompts}')
+    print(f'repeated_prompts_nc: {repeated_prompts_nc}')
+    print(f'repeated_lambdas: {repeated_lambdas}')
     tokenize_chat = partial(
         tokenizer.apply_chat_template, 
         tokenize=True, 
@@ -554,6 +593,8 @@ def multi_contextual_steering_hf(
     get_tokens = tokenize_chat if is_chat else tokenize_text
     repeated_inputs = [get_tokens(rp).to(model.device) for rp in repeated_prompts]
     repeated_inputs_nc = get_tokens(repeated_prompts_nc).to(model.device)
+    # print(f'repeated_inputs_shape: {len(repeated_inputs)}')
+    # print(f'repeated_inputs_nc_shape: {len(repeated_inputs_nc)}')
 
     batch_size = max_batch_size
     if show_progress:
@@ -561,6 +602,8 @@ def multi_contextual_steering_hf(
 
     output_tokens, output_logprobs = [], []
     for i in range(0, len(repeated_prompts_nc), mbsz):
+
+        # prepare batch inputs
         all_batch_ids = [ri.input_ids[i: i + mbsz] for ri in repeated_inputs]
         all_batch_mask = [ri.attention_mask[i: i + mbsz] for ri in repeated_inputs]
         batch_ids_nc = repeated_inputs_nc.input_ids[i: i + mbsz]
@@ -581,6 +624,8 @@ def multi_contextual_steering_hf(
         neg_inf = torch.tensor(-float('inf'), device=model.device)
 
         for _ in range(max(cur_lens), total_len):
+            
+            # generate logits for the all cases
             all_cur_logits = [
                 get_seqs_logits(batch_ids, batch_mask, model, tokenizer, cache_kv)
                 for batch_ids, batch_mask, cache_kv in zip(all_batch_ids, all_batch_mask, all_cache_kv)
@@ -588,13 +633,16 @@ def multi_contextual_steering_hf(
             cur_logits_nc = get_seqs_logits(
                 batch_ids_nc, batch_masks_nc, model, tokenizer, cache_kv_nc
             )
+
+            # apply contextual steering
             cos_logits = apply_multi_cos(
-                all_logits=[logits.unsqueeze(1) for logits in all_cur_logits], 
+                all_logits=[logits.unsqueeze(1) for logits in all_cur_logits], # add one diemension to the tensor at position 1
                 logits_nc=cur_logits_nc.unsqueeze(1),
                 temperature=temperature, 
                 all_lambdas=all_batch_lambdas,
                 return_probs=False,
             ) # (N, V)
+
             cos_logits = torch.log_softmax(cos_logits, dim=-1)
             if torch.any(torch.isnan(cos_logits)):
                 print(f"Lambdas {all_batch_lambdas[ci]} NaNs in cos_probs")
