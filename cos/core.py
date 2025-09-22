@@ -6,6 +6,73 @@ import torch.nn.functional as F
 from transformers import DynamicCache
 from cos.utils import *
 
+def apply_cos_unit_fisher(
+    logits, logits_nc, temperature, lambdas, mask=None,
+    return_probs=False, last_token=True,
+    *, base_mode="anchored",      # "anchored" | "delta"
+    base="off",                   # common base when base_mode="anchored": "off" or "on"
+    center=True, unit_fisher=True, eps=1e-8,
+):
+    """
+    Context steering with centering + unit-Fisher scaling BEFORE the final log_softmax.
+
+    base_mode="anchored":   cos_lp = log_softmax(base_lp + λ * δ̃)
+                            (use a *common* base_lp across contexts; base="off" recommended)
+    base_mode="delta":      cos_lp = log_softmax(base_lp + λ * δ̃) - log_softmax(base_lp)
+                            (returns Δ log-probs = effect-only; add base later if needed)
+
+    Returns log-probs (or probs) masked to response span, aligned with your gather/sum.
+    """
+    import torch
+    import torch.nn.functional as F
+
+    N, L, V = logits.shape
+    if mask is None:
+        mask = torch.zeros((N, L), device=logits.device, dtype=torch.bool)
+        mask[:, -1] = True
+    mask3 = mask[:, :, None]
+
+    # Log-probs with/without context
+    lp_on  = F.log_softmax(logits    / temperature, dim=-1)
+    lp_off = F.log_softmax(logits_nc / temperature, dim=-1)
+
+    # Influence in log-prob space
+    delta = lp_on - lp_off
+
+    # Choose baseline for centering/Fisher and for composition
+    if base_mode == "anchored":
+        base_lp = lp_off if base == "off" else lp_on
+    elif base_mode == "delta":
+        # any consistent base is fine; if you want no-context as reference, use lp_off
+        base_lp = lp_off
+    else:
+        raise ValueError('base_mode must be "anchored" or "delta"')
+
+    p_base = torch.exp(base_lp)
+
+    # Center and scale
+    if center:
+        mu = (p_base * delta).sum(dim=-1, keepdim=True)
+        delta = delta - mu
+    if unit_fisher:
+        var_t = (p_base * (delta ** 2)).sum(dim=-1)   # (N,L)
+        I0 = (var_t * mask).sum(dim=1)                # (N,)
+        scale = (I0 + eps).sqrt().clamp_min(eps)
+        delta = delta / scale[:, None, None]
+
+    # Compose and normalize once
+    steered = base_lp + lambdas[:, None, None] * delta
+    steered_lp = F.log_softmax(steered, dim=-1)
+
+    if base_mode == "delta":
+        # effect-only Δ log-probs (fair even if base varies)
+        base_norm = F.log_softmax(base_lp, dim=-1)
+        steered_lp = steered_lp - base_norm
+
+    steered_lp = steered_lp.masked_fill(~mask3, 0.0)
+    out = torch.exp(steered_lp) if return_probs else steered_lp
+    return out[:, -1] if last_token else out
+
 
 def apply_cos(
     logits: torch.tensor, 
@@ -50,16 +117,71 @@ def apply_cos(
     next_lp_nc = F.log_softmax(logits_nc / temperature, dim=-1) # (N, L, V)
     next_lp = next_lp.masked_fill(torch.logical_not(mask.bool())[:, :, None], 0) # (N, L, V)
     next_lp_nc = next_lp_nc.masked_fill(torch.logical_not(mask.bool())[:, :, None], 0)
-    
-    influence = next_lp - next_lp_nc # (N, L, V)
-    cos_lp = next_lp + lambdas[:, None, None] * influence # (N, L, V)
+    print(f'next_lp:', next_lp.shape)
+    print(f'next_lp_nc:', next_lp_nc.shape)
 
+    influence = next_lp - next_lp_nc # (N, L, V)
+    print(f'lambdas:', lambdas)
+    cos_lp = next_lp + lambdas[:, None, None] * influence # (N, L, V)
+    print(f'cos_lp:', cos_lp.shape)
     # normalize probabilities
     cos_lp = F.log_softmax(cos_lp, dim=-1)
     cos_lp = cos_lp.masked_fill(torch.logical_not(mask.bool())[:, :, None], 0)
-    output = torch.exp(cos_lp) if return_probs else cos_lp
+    print(f'if_return_probs: {return_probs}')
+    output = torch.exp(cos_lp) if return_probs else cos_lp  # equal to F.softmax(cos_lp, dim=-1)
     return output[:, -1] if last_token else output
 
+def apply_diff(
+    logits: torch.tensor, 
+    logits_nc: torch.tensor, 
+    temperature: float, 
+    # lambdas: torch.tensor,
+    mask: torch.tensor = None,
+    return_probs: bool = False,
+    last_token: bool = True,
+): 
+    """Calculate contexual steering influence for the next token
+    inf(c, t) = LLM(l1 + c).logprob(x+t) - LLM(l1).logprob(x+t)
+
+    Shape:
+        N: batch size
+        L: length of sequence
+        V: vocab size
+
+    Input:
+        logits: (N, L, V)
+        logits_nc: logits with no context (N, L, V)
+        lambdas: (N,)
+        mask: (N, L) if provided
+        last_token (bool): whether to return the last token only
+    
+    Returns:
+        probs: (N, V) if `last_token` is True else (N, L, V). If mask is provided, then only
+        the masked token gets assigned probability/log probability. Non masked ones get 
+        prob=1/logprob=0.
+    """
+    assert len(logits.shape) == len(logits_nc.shape) == 3
+    # assert len(lambdas.shape) == 1
+    # assert len(lambdas) == logits.shape[0]
+
+    if mask is None:
+        # same shape as logits, all 0, only the last one is 1
+        mask = torch.zeros(logits.shape[:-1], device=logits.device)
+        mask[:, -1] = 1
+
+    # TODO: can put temperature later?
+    next_lp = F.log_softmax(logits / temperature, dim=-1) # (N, L, V)
+    next_lp_nc = F.log_softmax(logits_nc / temperature, dim=-1) # (N, L, V)
+    next_lp = next_lp.masked_fill(torch.logical_not(mask.bool())[:, :, None], 0) # (N, L, V)
+    next_lp_nc = next_lp_nc.masked_fill(torch.logical_not(mask.bool())[:, :, None], 0)
+    print(f'next_lp:', next_lp.shape)
+    print(f'next_lp_nc:', next_lp_nc.shape)
+
+    influence = next_lp - next_lp_nc # (N, L, V)
+    influence = influence.masked_fill(torch.logical_not(mask.bool())[:, :, None], 0)
+    print(f'if_return_probs: {return_probs}')
+    output = torch.exp(influence) if return_probs else influence  # equal to F.softmax(cos_lp, dim=-1)
+    return output[:, -1] if last_token else output
 
 def apply_multi_cos(
     all_logits: List[torch.tensor], 
@@ -152,6 +274,7 @@ def contextual_steering_hf(
     skip_nan: bool = False,
     prompts_nc: List[str] = None,
     is_history: bool = True,
+    cache_implementation: str = None,
 ) -> dict:
     """Generate response via Contextual Steering forward model p(response | lambda, prompt, context). Output one generation per prompt per lambda.
 
@@ -246,9 +369,12 @@ def contextual_steering_hf(
         eos_reached = torch.zeros((batch_size, 1), device=model.device).bool()
         batch_out_tokens, batch_out_logprobs, batch_out_masks = [], [], []
 
-        #?
-        cache_kv = DynamicCache()
-        cache_kv_nc = DynamicCache()
+        if cache_implementation is False:
+            cache_kv = DynamicCache()
+            cache_kv_nc = DynamicCache()
+        else:
+            cache_kv = None
+            cache_kv_nc = None
 
         pad_id, eos_id = tokenizer.pad_token_id, tokenizer.eos_token_id
         neg_inf = torch.tensor(-float('inf'), device=model.device)
@@ -364,6 +490,7 @@ def get_cos_logprob_hf(
     verbose: bool = False,
     show_progress: bool = True,
     is_history: bool = False,
+    return_probs: bool = False,
 ) -> List[float]:
     """Return the log probability of the response given the prompt and context. This can be achieved
     with one forward pass as opposed to generating token by token.
@@ -489,10 +616,12 @@ def get_cos_logprob_hf(
         # calculate logits in one forward process
         with torch.no_grad():
             logits = model(batch_full_ids, batch_full_masks, use_cache=False).logits
-        logits = torch.log_softmax(logits, dim=-1)
+        ## ⚠️ Remove the two log_softmax(), as the code does this again in apply_cos()7[']
+        # logits = torch.log_softmax(logits, dim=-1)
+
         with torch.no_grad():
             logits_nc = model(batch_full_ids_neg, batch_full_masks_neg, use_cache=False).logits
-        logits_nc = torch.log_softmax(logits_nc, dim=-1)
+        # logits_nc = torch.log_softmax(logits_nc, dim=-1)
 
         # apply contextual steering
         cos_probs = apply_cos(
@@ -501,13 +630,16 @@ def get_cos_logprob_hf(
             temperature=temperature, 
             lambdas=batch_lambdas,
             mask=batch_resp_mask_last,
-            return_probs=True,
+            return_probs=return_probs, # change to True if you want probabilities, use false to keep logprobs to avoid numerical issues
             last_token=False
         ) # (N, L, V)
-        next_cos_lp = torch.roll(cos_probs, shifts=1, dims=1).log()
+        # ⚠️ remove the log
+        next_cos_lp = torch.roll(cos_probs, shifts=1, dims=1)
         res_lp = torch.gather(next_cos_lp, -1, batch_full_ids[..., None]).squeeze() # (N, L)
         if relative_logit:
             res_lp -= next_cos_lp.max(dim=-1).values
+        
+        # calculate total logprobs
         total_lp = torch.sum(res_lp, dim=-1) # (N)
         output_lps.append(res_lp)
         output_total_lps.append(total_lp)
@@ -528,6 +660,196 @@ def get_cos_logprob_hf(
         'contexts': repeated_contexts,
         'prompts_full': repeated_full,
         'lambdas': repeated_lambdas
+    }
+
+def get_logprob_diff(
+    model, 
+    tokenizer,
+    prompts: List[str],
+    contexts: List[str],
+    responses: List[str],
+    contexts_neg: List[str] = None,
+    is_chat: bool = True,
+    # lambdas: List[float] = [-1.0],
+    temperature: float = 1.0, # get the original distribution
+    max_gen_len: int = None,
+    max_batch_size: int = 8,
+    max_seq_len: int = None,
+    put_context_first: bool = True,
+    relative_logit: bool = False,
+    verbose: bool = False,
+    show_progress: bool = True,
+    is_history: bool = False,
+    return_probs: bool = False,
+) -> List[float]:
+    """Return the log probability of the response given the prompt and context. This can be achieved
+    with one forward pass as opposed to generating token by token.
+
+    Note:
+    - Assumes interaction happens in 1-round fashion: user -> assistant
+
+    Shape:
+        Np: number of prompts, same as the number of contexts
+        Nl: number of lambdas
+
+    Args:
+        model: Hugging Face model.
+        tokenizer: Hugging Face tokenizer.
+        prompts (List[str]): List of prompts.
+        contexts (List[str]): List of prompts contexts.
+        responses (List[str]): List of responses.
+        is_chat (bool): Whether the model is a chat model.
+        lambdas (list[float]): List of lambdas.
+        temperature (float): Temperature for sampling.
+    """
+    # max_gen_len = max_gen_len or max_seq_len - 1 # not used
+    mbsz = max_batch_size
+    tokenize_chat = partial(
+        tokenizer.apply_chat_template, 
+        tokenize=True, 
+        return_tensors='pt', 
+        padding=True, 
+        return_dict=True
+    )
+    tokenize_text = partial(tokenizer, return_tensors="pt", padding=True)
+    get_tokens = tokenize_chat if is_chat else tokenize_text
+    # print('contexts:', contexts)
+    if is_chat:
+        if contexts_neg is not None:
+            prompts_neg, _ = get_context_pair_dialogs(prompts, contexts_neg, put_context_first, is_history=is_history)
+            prompts, prompts_nc = get_context_pair_dialogs(prompts, contexts, put_context_first, is_history=is_history)
+        else:
+            prompts, prompts_nc = get_context_pair_dialogs(prompts, contexts, put_context_first, is_history=is_history)
+            prompts_neg = prompts_nc
+    else:
+        if contexts_neg is not None:
+            prompts_neg, _ = get_context_pair_texts(prompts, contexts_neg, put_context_first)
+            prompts, prompts_nc = get_context_pair_texts(prompts, contexts, put_context_first)
+        else:
+            prompts, prompts_nc = get_context_pair_texts(prompts, contexts, put_context_first)
+            prompts_neg = prompts_nc
+    repeated_contexts = tile_seqs(contexts, 1)
+    # repeated_lambdas = repeat_seqs(lambdas, len(prompts))
+    print(f'prompts: {prompts}')
+    if is_chat:
+        prompts_full = [
+            p + [{'role': 'assistant', 'content': r}] for p, r in zip(prompts, responses)
+        ]
+        prompts_full_neg = [
+            p + [{'role': 'assistant', 'content': r}] for p, r in zip(prompts_neg, responses)
+        ]
+    else:
+        prompts_full = [f"{p} {r}" for p, r in zip(prompts, responses)]
+        prompts_full_neg = [f"{p} {r}" for p, r in zip(prompts_neg, responses)]
+
+    print(f"prompts_full: {prompts_full}")
+    repeated_prompts = tile_seqs(prompts, 1)
+    repeated_toks_prompts = get_tokens(repeated_prompts).to(model.device)
+    repeated_toks_prompts_neg = get_tokens(tile_seqs(prompts_neg, 1)).to(model.device)
+    repeated_full = tile_seqs(prompts_full, 1)
+    repeated_full_neg = tile_seqs(prompts_full_neg, 1)
+    repeated_toks_full = get_tokens(repeated_full).to(model.device)
+    repeated_toks_full_neg = get_tokens(repeated_full_neg).to(model.device)
+
+    batch_size = max_batch_size
+    if show_progress:
+        pbar_batch = tqdm.tqdm(total=len(repeated_full))
+
+    output_lps, output_total_lps = [], []
+    pad_id = tokenizer.pad_token_id
+    eos_id = tokenizer.eos_token_id
+    for i in range(0, len(repeated_full), mbsz):
+        batch_prompt_masks = repeated_toks_prompts.attention_mask[i: i + mbsz]
+
+        batch_full_ids = repeated_toks_full.input_ids[i: i + mbsz]
+        batch_full_ids_neg = repeated_toks_full_neg.input_ids[i: i + mbsz]
+        batch_full_masks = repeated_toks_full.attention_mask[i: i + mbsz]
+        batch_full_masks_neg = repeated_toks_full_neg.attention_mask[i: i + mbsz]
+        # batch_lambdas = torch.tensor(repeated_lambdas[i: i + mbsz], device=model.device)
+
+        # pad full_ids_nc to the same length as full_ids
+        dlen_full_ids = batch_full_ids.shape[1] - batch_full_ids_neg.shape[1]
+        if dlen_full_ids > 0:
+            batch_full_ids_neg = F.pad(batch_full_ids_neg, (dlen_full_ids, 0), value=pad_id)
+            batch_full_masks_neg = F.pad(batch_full_masks_neg, (dlen_full_ids, 0), value=0)
+            batch_res_len = batch_full_masks.sum(dim=1) - batch_prompt_masks.sum(dim=1)
+        else:
+            batch_full_ids = F.pad(batch_full_ids, (-dlen_full_ids, 0), value=pad_id)
+            batch_full_masks = F.pad(batch_full_masks, (-dlen_full_ids, 0), value=0)
+            batch_res_len = batch_full_masks_neg.sum(dim=1) - batch_prompt_masks.sum(dim=1)
+
+        # pad and roll so that response align
+        batch_num_pads = batch_res_len.max() - batch_res_len.min()
+        batch_full_ids = F.pad(batch_full_ids, (0, batch_num_pads), value=eos_id)
+        batch_full_ids_neg = F.pad(batch_full_ids_neg, (0, batch_num_pads), value=eos_id)
+        batch_full_masks = F.pad(batch_full_masks, (0, batch_num_pads), value=0)
+        batch_full_masks_neg = F.pad(batch_full_masks_neg, (0, batch_num_pads), value=0)
+        n_cols = batch_full_ids.size(1)
+        # shift to the right for long response
+        shifts = batch_res_len - batch_res_len.min()
+        rolled_indices = (torch.arange(n_cols, device=model.device).unsqueeze(0) - shifts.unsqueeze(1)) % n_cols
+
+        # aligned ids and masks
+        batch_full_ids = batch_full_ids.gather(1, rolled_indices)
+        batch_full_ids_neg = batch_full_ids_neg.gather(1, rolled_indices)
+        left_mask = torch.arange(n_cols, device=model.device).unsqueeze(0) < shifts.unsqueeze(1)
+        batch_full_ids = torch.where(left_mask, pad_id, batch_full_ids)
+        batch_full_ids_neg = torch.where(left_mask, pad_id, batch_full_ids_neg)
+        batch_full_masks = batch_full_masks.gather(1, rolled_indices)
+        batch_full_masks_neg = batch_full_masks_neg.gather(1, rolled_indices)
+
+        len_prompt = batch_full_ids.shape[1] - batch_res_len.max()
+        is_prompt = torch.arange(batch_full_ids.shape[1], device=model.device) < len_prompt
+        batch_resp_masks = torch.where(is_prompt[None, ], torch.zeros_like(batch_full_masks), batch_full_masks.bool())
+        batch_resp_mask_last = torch.roll(batch_resp_masks, shifts=-1, dims=1)
+
+        # calculate logits in one forward process
+        with torch.no_grad():
+            logits = model(batch_full_ids, batch_full_masks, use_cache=False).logits
+        ## ⚠️ Remove the two log_softmax(), as the code does this again in apply_cos()7[']
+        # logits = torch.log_softmax(logits, dim=-1)
+
+        with torch.no_grad():
+            logits_nc = model(batch_full_ids_neg, batch_full_masks_neg, use_cache=False).logits
+        # logits_nc = torch.log_softmax(logits_nc, dim=-1)
+
+        # apply contextual steering
+        cos_probs = apply_diff(
+            logits=logits, 
+            logits_nc=logits_nc,
+            temperature=temperature, 
+            # lambdas=batch_lambdas,
+            mask=batch_resp_mask_last,
+            return_probs=return_probs, # change to True if you want probabilities, use false to keep logprobs to avoid numerical issues
+            last_token=False
+        ) # (N, L, V)
+        # ⚠️ remove the log
+        next_cos_lp = torch.roll(cos_probs, shifts=1, dims=1)
+        res_lp = torch.gather(next_cos_lp, -1, batch_full_ids[..., None]).squeeze() # (N, L)
+        if relative_logit:
+            res_lp -= next_cos_lp.max(dim=-1).values
+        
+        # calculate total logprobs
+        total_lp = torch.sum(res_lp, dim=-1) # (N)
+        output_lps.append(res_lp)
+        output_total_lps.append(total_lp)
+        if show_progress:
+            pbar_batch.update(min(mbsz, len(batch_full_ids)))
+
+    max_len = max(t.shape[1] for t in output_lps)
+    # neg_inf = torch.tensor(-float('inf'), device=model.device)
+    output_lps = [
+        F.pad(t, (0, max_len - t.shape[1]), value=0) for t in output_lps
+    ]
+    output_lps = torch.cat(output_lps, dim=0)
+    output_total_lps = torch.cat(output_total_lps, dim=0)
+    return {
+        "logprobs": output_lps.cpu(),
+        "total_logprobs": output_total_lps.cpu(),
+        'prompts': repeated_prompts,
+        'contexts': repeated_contexts,
+        'prompts_full': repeated_full,
+        # 'lambdas': repeated_lambdas
     }
 
 def multi_contextual_steering_hf(
@@ -711,3 +1033,433 @@ def multi_contextual_steering_hf(
         'prompts_nc': repeated_prompts_nc,
         'lambdas': repeated_lambdas
     }
+
+def infer_context_only_cos(
+    model,
+    tokenizer,
+    prompts: List[str],
+    contexts: List[str],
+    responses: List[str],
+    *,
+    lambda_value: float = 1.0,         # single λ for all contexts
+    base_mode: str = "anchored",       # "anchored" | "delta"
+    base: str = "off",                 # common baseline when base_mode="anchored": "off" or "on"
+    temperature: float = 1.0,
+    is_chat: bool = True,
+    put_context_first: bool = True,
+    is_history: bool = False,
+    max_seq_len: int = 512,
+    max_batch_size: int = 8,
+    show_progress: bool = True,
+) -> Dict[str, Any]:
+    """
+    Context-only inference with Context Steering (CoS) and unit-Fisher normalization.
+
+    For each context c and prompt/response pair (P, X), compute token log-probs using
+        cos_lp = apply_cos_unit_fisher(logits_on, logits_off, temperature, λ, mask=resp_mask_last, ...)
+    where `resp_mask_last` marks positions that *predict* the response tokens.
+
+    base_mode="anchored": absolute log-probs with a common baseline (recommended for ranking contexts).
+    base_mode="delta":    effect-only Δ log-probs relative to the baseline (baseline cancels).
+
+    Returns:
+      {
+        "total_lp": Tensor[K, N],          # per-context (rows) × per-prompt (cols)
+        "prompts": List[str],
+        "contexts": List[str],
+        "responses": List[str],
+        "lambda": float,
+        "base_mode": str,
+        "base": str,
+      }
+    """
+    import torch
+    import torch.nn.functional as F
+    from functools import partial
+    import tqdm
+
+    assert len(prompts) == len(responses), "prompts and responses must match in length"
+    N = len(prompts)
+    K = len(contexts)
+    BATCH = max_batch_size
+    device = next(model.parameters()).device
+
+    # -----------------------------
+    # Tokenizers (chat vs plain text)
+    # -----------------------------
+    tokenize_chat = partial(
+        tokenizer.apply_chat_template,
+        tokenize=True, return_tensors='pt', padding=True, return_dict=True
+    )
+    tokenize_text = partial(tokenizer, return_tensors="pt", padding=True)
+    get_tokens = tokenize_chat if is_chat else tokenize_text
+
+    # -----------------------------
+    # Helper: build ON/OFF sequences for a context
+    # -----------------------------
+    def _build_pairs_for_context(ctx: str):
+        # auto-detect dialog prompts: [[{role, content}, ...], ...]
+        prompt_is_dialog = (
+            is_chat
+            and isinstance(prompts[0], (list, tuple))
+            and len(prompts[0]) > 0
+            and isinstance(prompts[0][0], dict)
+            and "role" in prompts[0][0] and "content" in prompts[0][0]
+        )
+        ih = is_history or prompt_is_dialog
+
+        if is_chat:
+            prom_with, prom_off = get_context_pair_dialogs(
+                prompts, [ctx] * N, put_context_first, is_history=ih
+            )
+            full_on  = [p + [{'role': 'assistant', 'content': r}] for p, r in zip(prom_with, responses)]
+            full_off = [p + [{'role': 'assistant', 'content': r}] for p, r in zip(prom_off,  responses)]
+        else:
+            prom_with, prom_off = get_context_pair_texts(prompts, [ctx] * N, put_context_first)
+            full_on  = [f"{p} {r}" for p, r in zip(prom_with, responses)]
+            full_off = [f"{p} {r}" for p, r in zip(prom_off,  responses)]
+        return prom_with, prom_off, full_on, full_off
+
+    # -----------------------------
+    # Helper: mask positions that *predict* response tokens
+    # Equivalent to: roll(response_token_mask, -1) with last column zeroed.
+    # Uses PROMPT-ONLY mask to find the first response token index r0.
+    # -----------------------------
+    def build_resp_predictor_mask_from_prompt(prompt_mask: torch.Tensor,
+                                              full_mask: torch.Tensor) -> torch.Tensor:
+        B, L = full_mask.shape
+        out = torch.zeros((B, L), dtype=torch.bool, device=full_mask.device)
+        prompt_len = prompt_mask.sum(dim=1)   # (B,)
+        full_len   = full_mask.sum(dim=1)     # (B,)
+        for b in range(B):
+            r0 = int(prompt_len[b].item())          # first response token index in FULL
+            start = max(r0 - 1, 0)                  # predict r1 at position r0-1
+            end   = int(full_len[b].item()) - 2     # exclude last column (no next token)
+            if end >= start:
+                out[b, start:end+1] = True
+        return out
+
+    # -----------------------------
+    # Main loop over contexts
+    # -----------------------------
+    per_ctx_totals = []
+    if show_progress:
+        pbar = tqdm.tqdm(total=K, desc="Contexts (CoS)")
+
+    pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        # fallback if model has no pad token
+        pad_id = tokenizer.eos_token_id
+
+    for ctx in contexts:
+        # 1) Build ON/OFF prompts and FULL sequences for this context
+        prom_with, prom_off, full_on, full_off = _build_pairs_for_context(ctx)
+
+        # 2) Tokenize PROMPT-ONLY and FULL
+        toks_prompt_on  = get_tokens(prom_with).to(device)
+        toks_prompt_off = get_tokens(prom_off).to(device)
+        toks_full_on    = get_tokens(full_on).to(device)
+        toks_full_off   = get_tokens(full_off).to(device)
+
+        totals_ctx = []
+
+        # 3) Batch computation
+        for i in range(0, N, BATCH):
+            # PROMPT-ONLY masks (for response start index)
+            p_on_mask  = toks_prompt_on.attention_mask[i: i+BATCH]
+            p_off_mask = toks_prompt_off.attention_mask[i: i+BATCH]
+
+            # FULL ids/masks
+            ids_on  = toks_full_on.input_ids[i: i+BATCH]
+            ids_off = toks_full_off.input_ids[i: i+BATCH]
+            m_on    = toks_full_on.attention_mask[i: i+BATCH]
+            m_off   = toks_full_off.attention_mask[i: i+BATCH]
+
+            # 3a) Pad to same length (so logits_on/logits_off have identical shapes)
+            maxL = max(ids_on.shape[1], ids_off.shape[1])
+            if ids_on.shape[1]  < maxL:
+                ids_on = F.pad(ids_on, (0, maxL - ids_on.shape[1]), value=pad_id)
+                m_on   = F.pad(m_on,   (0, maxL - m_on.shape[1]),   value=0)
+            if ids_off.shape[1] < maxL:
+                ids_off = F.pad(ids_off, (0, maxL - ids_off.shape[1]), value=pad_id)
+                m_off   = F.pad(m_off,   (0, maxL - m_off.shape[1]),   value=0)
+
+            # 3b) Forward passes
+            with torch.no_grad():
+                logits_on  = model(ids_on,  m_on,  use_cache=False).logits
+                logits_off = model(ids_off, m_off, use_cache=False).logits
+
+            # 3c) Build mask of positions that *predict* response tokens (FULL-ON)
+            resp_mask_last = build_resp_predictor_mask_from_prompt(
+                prompt_mask=p_on_mask,
+                full_mask=m_on
+            )
+
+            # 3d) Apply CoS (center + unit-Fisher BEFORE final softmax)
+            batch_lambdas = torch.full((ids_on.size(0),), float(lambda_value), device=device)
+            cos_lp = apply_cos_unit_fisher(
+                logits=logits_on,
+                logits_nc=logits_off,
+                temperature=temperature,
+                lambdas=batch_lambdas,
+                mask=resp_mask_last,
+                return_probs=False,
+                last_token=False,
+                base_mode=base_mode,
+                base=base,
+            )  # (B, L, V) log-probs (or Δ log-probs if base_mode="delta")
+
+            # 3e) Gather next-token log-probs on the gold ids and sum over response span
+            next_lp = torch.roll(cos_lp, shifts=1, dims=1)
+            res_lp  = torch.gather(next_lp, -1, ids_on[..., None]).squeeze(-1)  # (B, L)
+            total_lp = (res_lp * resp_mask_last).sum(dim=1)                      # (B,)
+
+            totals_ctx.append(total_lp)
+
+        totals_ctx = torch.cat(totals_ctx, dim=0)[:N]  # (N,)
+        per_ctx_totals.append(totals_ctx)
+
+        if show_progress:
+            pbar.update(1)
+
+    if show_progress:
+        pbar.close()
+
+    total_mat = torch.stack(per_ctx_totals, dim=0)  # (K, N)
+
+    return {
+        "total_lp": total_mat,
+        "prompts": prompts,
+        "contexts": contexts,
+        "responses": responses,
+        "lambda": float(lambda_value),
+        "base_mode": base_mode,
+        "base": base,
+    }
+
+# def infer_context_only_cos(
+#     model,
+#     tokenizer,
+#     prompts: List[str],
+#     contexts: List[str],
+#     responses: List[str],
+#     *,
+#     lambda_value: float = 1.0,         # single λ for all contexts
+#     base_mode: str = "anchored",       # "anchored" | "delta" (see docstring)
+#     base: str = "off",                 # common baseline when base_mode="anchored": "off" or "on"
+#     temperature: float = 1.0,
+#     is_chat: bool = True,
+#     put_context_first: bool = True,
+#     is_history: bool = False,
+#     max_seq_len: int = 512,
+#     max_batch_size: int = 8,
+#     show_progress: bool = True,
+# ) -> Dict[str, Any]:
+#     """
+#     Context-only inference with Context Steering (CoS) and unit-Fisher normalization.
+
+#     For each context c and prompt/response pair (P, X), we compute token log-probs
+#     using:
+#         cos_lp = apply_cos_unit_fisher(
+#                     logits_on, logits_off, temperature, λ,
+#                     mask=response_mask, base_mode=..., base=...
+#                  )
+#     and then sum over the response span.
+
+#     Scoring modes:
+#       - base_mode="anchored": returns absolute log-probs using a COMMON baseline
+#         ('off' recommended). Fair across contexts at a fixed λ.
+#       - base_mode="delta": returns Δ log-probs relative to the baseline
+#         (base cancels). Also fair across contexts.
+
+#     Returns
+#     -------
+#     {
+#       "total_lp": Tensor[K, N],          # per-context (rows) × per-prompt (cols) totals
+#       "base_total_lp": Optional[Tensor[N]],  # only for anchored mode; baseline (no-context) totals
+#       "prompts": List[str],
+#       "contexts": List[str],
+#       "responses": List[str],
+#       "lambda": float,
+#       "base_mode": str,
+#       "base": str,
+#     }
+#     """
+#     assert len(prompts) == len(responses), "prompts and responses must match in length"
+#     N = len(prompts)
+#     K = len(contexts)
+#     BATCH = max_batch_size
+
+#     # Chat/text tokenizers (match your existing code style)
+#     tokenize_chat = partial(
+#         tokenizer.apply_chat_template,
+#         tokenize=True, return_tensors='pt', padding=True, return_dict=True
+#     )
+#     tokenize_text = partial(tokenizer, return_tensors="pt", padding=True)
+#     get_tokens = tokenize_chat if is_chat else tokenize_text
+
+#     # Helper to build ON/OFF prompts and append responses
+#     def _build_pairs_for_context(ctx: str):
+#         if is_chat:
+#             prom_with, prom_off = get_context_pair_dialogs(prompts, [ctx]*N, put_context_first, is_history=is_history)
+#             full_on  = [p + [{'role': 'assistant', 'content': r}] for p, r in zip(prom_with, responses)]
+#             full_off = [p + [{'role': 'assistant', 'content': r}] for p, r in zip(prom_off,  responses)]
+#         else:
+#             prom_with, prom_off = get_context_pair_texts(prompts, [ctx]*N, put_context_first)
+#             full_on  = [f"{p} {r}" for p, r in zip(prom_with, responses)]
+#             full_off = [f"{p} {r}" for p, r in zip(prom_off,  responses)]
+#         return prom_with, prom_off, full_on, full_off
+
+#     # Storage
+#     per_ctx_totals = []
+
+#     if show_progress:
+#         pbar = tqdm.tqdm(total=K, desc="Contexts (CoS)")
+
+#     for ctx in contexts:
+#         # 1) Build ON/OFF sequences for this context
+#         _, _, full_on, full_off = _build_pairs_for_context(ctx)
+
+#         # 2) Tokenize
+#         toks_full_on  = get_tokens(full_on).to(model.device)
+#         toks_full_off = get_tokens(full_off).to(model.device)
+
+#         totals_ctx = []
+
+#         # 3) Iterate batches
+#         for i in range(0, N, BATCH):
+#             ids_on  = toks_full_on.input_ids[i : i+BATCH]
+#             ids_off = toks_full_off.input_ids[i : i+BATCH]
+#             m_on    = toks_full_on.attention_mask[i : i+BATCH]
+#             m_off   = toks_full_off.attention_mask[i : i+BATCH]
+
+#             # Align lengths so the response spans align (same trick as your pipeline)
+#             dlen = ids_on.shape[1] - ids_off.shape[1]
+#             pad_id = tokenizer.pad_token_id
+#             eos_id = tokenizer.eos_token_id
+
+#             if dlen > 0:
+#                 ids_off = F.pad(ids_off, (dlen, 0), value=pad_id)
+#                 m_off   = F.pad(m_off,   (dlen, 0), value=0)
+#                 # response length estimate from masks
+#                 res_len = m_on.sum(dim=1) - m_off.sum(dim=1) + (m_off.sum(dim=1) - m_off.sum(dim=1))  # keep shape
+#                 res_len = m_on.sum(dim=1) - (m_on.sum(dim=1) - (ids_on.ne(pad_id)).long().sum(dim=1))  # fallback
+#             else:
+#                 ids_on = F.pad(ids_on, (-dlen, 0), value=pad_id)
+#                 m_on   = F.pad(m_on,   (-dlen, 0), value=0)
+#                 res_len = m_off.sum(dim=1) - (m_off.sum(dim=1) - (ids_off.ne(pad_id)).long().sum(dim=1))
+
+#             # Pad & roll to align response ends
+#             num_cols = max(ids_on.shape[1], ids_off.shape[1])
+#             # If shapes changed in padding above, ensure masks match ids
+#             ids_on  = F.pad(ids_on,  (0, 0), value=pad_id)
+#             ids_off = F.pad(ids_off, (0, 0), value=pad_id)
+#             m_on    = F.pad(m_on,    (0, 0), value=0)
+#             m_off   = F.pad(m_off,   (0, 0), value=0)
+
+#             # Compute prompt lengths (best-effort from masks)
+#             len_on  = m_on.sum(dim=1)
+#             len_off = m_off.sum(dim=1)
+#             # Align by right-rolling to the max response length
+#             max_res = (len_on.max() - len_on.min()).abs()  # dummy usage to keep torch ops; real align below
+
+#             # A simpler, robust way: treat the last non-pad positions as response predictions
+#             # Build response mask as "everything after first PAD in each row is response"
+#             def _resp_mask(attn_mask):
+#                 # predict tokens at positions where next-token belongs to response => shift by 1
+#                 resp = attn_mask.clone().bool()
+#                 # zero-out the prompt side by looking at leftmost contiguous 1's (best-effort)
+#                 # We'll use the existing pattern from your code instead:
+#                 return resp
+
+#             # We will use a safer approach directly from your code path:
+#             # Construct mask where model predicts each response token (shifted)
+#             # Here we approximate: all tokens after the prompt are response
+#             # prompt length proxy: first index where OFF and ON differ -> but to stay robust,
+#             # use the 'next-token' mask from attention masks:
+#             is_prompt = torch.zeros_like(m_on, dtype=torch.bool)
+#             # mark the last token prediction positions:
+#             resp_mask_last = torch.zeros_like(m_on, dtype=torch.bool)
+#             # fallback: assume last L positions form the response; easier is to set all True and
+#             # rely on apply_cos_unit_fisher's per-position masking.
+#             # If your existing pipeline already builds 'batch_resp_mask_last', use that here.
+
+#             # ------- Forward passes -------
+#             with torch.no_grad():
+#                 logits_on  = model(ids_on,  m_on,  use_cache=False).logits
+#                 logits_off = model(ids_off, m_off, use_cache=False).logits
+
+#             # Build mask predicting the next token of each position; we will emulate your logic:
+#             # Positions where the response token is predicted are those where attention_mask is 1,
+#             # but the "next" token belongs to the response. A clean and safe choice used in your code:
+#             #   batch_resp_mask_last = torch.roll(batch_resp_masks, shifts=-1, dims=1)
+#             # Here, mark all non-pad positions except the very last one as potential predictions:
+#             resp_mask = m_on.bool()   # same length as ids_on
+#             resp_mask_last = torch.roll(resp_mask, shifts=-1, dims=1)
+#             # zero the last column to avoid indexing outside range
+#             resp_mask_last[:, -1] = False
+
+#             # Apply CoS with centering + unit-Fisher BEFORE final softmax
+#             cos_lp = apply_cos_unit_fisher(
+#                 logits=logits_on,
+#                 logits_nc=logits_off,
+#                 temperature=temperature,
+#                 lambdas=torch.full((ids_on.size(0),), float(lambda_value), device=ids_on.device),
+#                 mask=resp_mask_last,             # response positions only
+#                 return_probs=False,
+#                 last_token=False,
+#                 base_mode=base_mode,
+#                 base=base,                       # only used in "anchored" mode
+#             )   # (B, L, V) log-probs or Δ log-probs
+
+#             # Align to "predict next token", gather gold ids, sum over response span
+#             next_lp = torch.roll(cos_lp, shifts=1, dims=1)
+#             res_lp  = torch.gather(next_lp, -1, ids_on[..., None]).squeeze(-1)  # (B, L)
+#             total_lp = (res_lp * resp_mask_last).sum(dim=1)                      # (B,)
+
+#             totals_ctx.append(total_lp)
+
+#         totals_ctx = torch.cat(totals_ctx, dim=0)[:N]    # (N,)
+#         per_ctx_totals.append(totals_ctx)                # list of (N,)
+
+#         if show_progress:
+#             pbar.update(1)
+
+#     if show_progress:
+#         pbar.close()
+
+#     total_mat = torch.stack(per_ctx_totals, dim=0)   # (K, N)
+
+#     out = {
+#         "total_lp": total_mat,
+#         "prompts": prompts,
+#         "contexts": contexts,
+#         "responses": responses,
+#         "lambda": float(lambda_value),
+#         "base_mode": base_mode,
+#         "base": base,
+#     }
+
+#     # Optionally provide the baseline totals when in anchored mode
+#     if base_mode == "anchored":
+#         # Compute baseline (no-context) totals once (any context gives same OFF baseline)
+#         # Reuse the last 'full_off' tokenization from above by rebuilding for an empty ctx
+#         _, prom_off0, full_on0, full_off0 = _build_pairs_for_context(contexts[0])
+#         toks_full_off0 = get_tokens(full_off0).to(model.device)
+
+#         base_totals = []
+#         for i in range(0, N, BATCH):
+#             ids = toks_full_off0.input_ids[i : i+BATCH]
+#             mask = toks_full_off0.attention_mask[i : i+BATCH]
+#             with torch.no_grad():
+#                 base_logits = model(ids, mask, use_cache=False).logits
+#             base_lp = F.log_softmax(base_logits, dim=-1)
+#             resp_mask = mask.bool()
+#             resp_mask_last = torch.roll(resp_mask, shifts=-1, dims=1)
+#             resp_mask_last[:, -1] = False
+#             next_lp = torch.roll(base_lp, shifts=1, dims=1)
+#             res_lp  = torch.gather(next_lp, -1, ids[..., None]).squeeze(-1)
+#             base_totals.append((res_lp * resp_mask_last).sum(dim=1))
+#         out["base_total_lp"] = torch.cat(base_totals, dim=0)[:N]
+
+#     return out

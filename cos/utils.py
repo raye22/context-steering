@@ -1,3 +1,19 @@
+import os
+os.environ["HF_HOME"]           = "/media/volume/yueru-s-data/hf_cache"
+os.environ["TRANSFORMERS_CACHE"]= "/media/volume/yueru-s-data/hf_cache"
+os.environ["HF_DATASETS_CACHE"] = "/media/volume/yueru-s-data/hf_cache"
+os.environ["HF_METRICS_CACHE"]  = "/media/volume/yueru-s-data/hf_cache"
+
+# now you can safely import everything else
+from typing import List, Literal, TypedDict, Dict, Any
+import torch
+import shutil
+
+torch._dynamo.disable()
+
+import unsloth
+from unsloth import FastLanguageModel
+# … other imports …
 from typing import List, Literal, TypedDict
 import torch
 from transformers import AutoModelForCausalLM, AutoModelForSeq2SeqLM, AutoTokenizer
@@ -5,7 +21,6 @@ from cos.model_paths import *
 
 TaskType = Literal["qualitative", "lambda_inference"]
 SupportedModel = Literal["gptj", "t0pp", "llama-7b", "llama-7b-chat", "alpaca", "mistral"]
-
 
 class Task(TypedDict):
     prompt: str
@@ -39,70 +54,78 @@ HF_MODEL_SOURCE = {
     "llama-3-8b-chat": HF_LLAMA_3_8B_CHAT_DIR,
     "alpaca": HF_ALPACA_DIR,
     "mistral-instruct": "mistralai/Mistral-7B-Instruct-v0.1",
-
 }
 
-def load_hf_model_and_tokenizer(model_name: str):
-    """
-    Loads model and tokenizer based on model_name. Sets padding options.
-    """
-    model_class = HF_MODEL_CLASS.get(model_name)
-    ckpt_dir = HF_MODEL_SOURCE.get(model_name)
-    tokenizer = AutoTokenizer.from_pretrained(ckpt_dir)
+CACHE_ENV = "/media/volume/yueru-s-data/hf_cache"
+# Ensure HF cache directories are set before any HF import
+os.environ.setdefault("HF_HOME", CACHE_ENV)
+os.environ.setdefault("TRANSFORMERS_CACHE", CACHE_ENV)
+os.environ.setdefault("HF_DATASETS_CACHE", CACHE_ENV)
+os.environ.setdefault("HF_METRICS_CACHE", CACHE_ENV)
 
-    if "llama-2" in model_name:
-        model = model_class.from_pretrained(
-            ckpt_dir, 
-            device_map='cuda',
-            torch_dtype=torch.float16 # to stay the same as llama
-        )
-    elif "llama-3" in model_name:
-        model = model_class.from_pretrained(
-            ckpt_dir, 
-            device_map='cuda',
-            torch_dtype=torch.bfloat16 # to stay the same as llama
-        )
+# Remove any stale compiled cache to force fresh load
+compiled_cache_dir = os.path.join(os.getcwd(), "unsloth_compiled_cache")
+if os.path.exists(compiled_cache_dir):
+    shutil.rmtree(compiled_cache_dir)
+
+
+def load_hf_model_and_tokenizer(
+    model_name: str,
+    use_unsloth: bool = True,
+    from_pretrained_kwargs: Dict[str, Any] = None
+):
+    """
+    Loads a model and tokenizer. Pass overrides via `from_pretrained_kwargs`.
+
+    Default Unsloth kwargs enforce no compilation and exact model name:
+      - load_in_4bit: True
+      - fast_inference: False  # disable torch.compile
+      - use_exact_model_name: True
+      - cache_dir: HF_HOME
+    """
+    from_pretrained_kwargs = from_pretrained_kwargs or {}
+
+    if use_unsloth:
+        default_args = {
+            "model_name": model_name,
+            "max_seq_length": 1024,
+            "dtype": None,
+            "load_in_4bit": True,
+            "fast_inference": False,
+            "use_exact_model_name": True,
+            "cache_dir": os.environ["HF_HOME"],
+        }
+        # Merge user overrides last so they can override defaults
+        hf_args = {**default_args, **from_pretrained_kwargs}
+        model, tokenizer = FastLanguageModel.from_pretrained(**hf_args)
     else:
-        model = model_class.from_pretrained(
-            ckpt_dir, 
-            device_map='cuda',
-        ).cuda()
-    
-    if tokenizer.pad_token is None:
+        model_class = HF_MODEL_CLASS.get(model_name)
+        ckpt_dir = HF_MODEL_SOURCE.get(model_name)
+        tokenizer = AutoTokenizer.from_pretrained(ckpt_dir)
         if "llama-2" in model_name:
-            tokenizer.add_special_tokens({"pad_token":"<pad>"})
-            tokenizer.chat_template = (
-"{% if messages[0]['role'] == 'system' %}"
-    "{% set system_message = '<<SYS>>\n' + messages[0]['content'] | trim + '\n<</SYS>>\n\n' %}"
-    "{% set messages = messages[1:] %}"
-"{% else %}"
-    "{% set system_message = '' %}"
-"{% endif %}"
-
-"{% for message in messages %}"
-    "{% if (message['role'] == 'user') != (loop.index0 % 2 == 0) %}"
-        "{{ raise_exception('Conversation roles must alternate user/assistant/user/assistant/...') }}"
-    "{% endif %}"
-
-    "{% if loop.index0 == 0 %}"
-        "{% set content = system_message + message['content'] %}"
-    "{% else %}"
-        "{% set content = message['content'] %}"
-    "{% endif %}"
-
-    "{% if message['role'] == 'user' %}"
-        "{{ bos_token + '[INST] ' + content | trim + ' [/INST]' }}"
-    "{% elif message['role'] == 'assistant' %}"
-        "{{ ' ' + content | trim + ' ' + eos_token }}"
-    "{% endif %}"
-"{% endfor %}")
-            model.resize_token_embeddings(len(tokenizer))
-            model.config.pad_token_id = tokenizer.pad_token_id
+            model = model_class.from_pretrained(
+                ckpt_dir, device_map='cuda', torch_dtype=torch.float16
+            )
+        elif "llama-3" in model_name:
+            model = model_class.from_pretrained(
+                ckpt_dir, device_map='cuda', torch_dtype=torch.bfloat16
+            )
         else:
-            tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "left"
+            model = model_class.from_pretrained(
+                ckpt_dir, device_map='cuda'
+            ).cuda()
 
+    # Ensure tokenizer has pad token
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
     return model, tokenizer
+# Usage example:
+# model, tokenizer = load_hf_model_and_tokenizer(
+#     "unsloth/Phi-4-mini-instruct-unsloth-bnb-4bit",
+#     from_pretrained_kwargs={"load_in_4bit": False, "use_exact_model_name": True}
+# )
+
 
 def assert_dialog(dialog):
     assert type(dialog) == list
